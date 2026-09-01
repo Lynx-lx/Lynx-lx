@@ -24,6 +24,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from viscale.detection import POWER_SECURITY_CLASSES, build_yolov5s_lite
+from viscale.io.camera import DEFAULT_LOCAL_CAMERA, load_camera_config
+from viscale.measurement.scale import meters_per_pixel_at_depth
 from viscale.risk import DetectionRecord, RiskAssessor
 
 # ---------- 预留配置（可被 CLI / 环境变量覆盖）----------
@@ -45,7 +47,14 @@ BOX_COLORS = [
 GRADE_COLOR = {1: "#27ae60", 2: "#2980b9", 3: "#e67e22", 4: "#c0392b"}
 
 _lock = threading.Lock()
-_runtime: dict = {"model": None, "device": None, "assessor": None, "weights_note": ""}
+_runtime: dict = {
+    "model": None,
+    "device": None,
+    "assessor": None,
+    "weights_note": "",
+    "camera_note": "",
+    "mpp_from_camera": None,
+}
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -70,16 +79,28 @@ def _load_weights(model: torch.nn.Module, path: str, device: torch.device) -> st
     return f"已加载权重: {p}"
 
 
-def init_runtime(weights: str, attn: str, device_name: str) -> None:
+def init_runtime(
+    weights: str,
+    attn: str,
+    device_name: str,
+    camera_config: str | None = None,
+    working_distance_m: float = 0.0,
+) -> None:
     with _lock:
         device = _resolve_device(device_name)
         model = build_yolov5s_lite(num_classes=len(POWER_SECURITY_CLASSES), attn=attn).to(device)
         model.eval()
         note = _load_weights(model, weights, device)
+        cam_path = camera_config or str(DEFAULT_LOCAL_CAMERA)
+        cam, cam_msg = load_camera_config(cam_path)
+        print(cam_msg)
+        mpp = meters_per_pixel_at_depth(cam, working_distance_m) if working_distance_m > 0 else None
         _runtime["model"] = model
         _runtime["device"] = device
         _runtime["assessor"] = RiskAssessor()
         _runtime["weights_note"] = note
+        _runtime["camera_note"] = cam_msg.split("\n")[0]
+        _runtime["mpp_from_camera"] = mpp
         print(note)
         print(f"device={device} params={model.parameter_count() / 1e6:.2f}M attn={attn}")
 
@@ -173,7 +194,7 @@ def run_infer(image, conf: float, iou: float, meters_per_pixel: float, imgsz: in
         rows.append({"cls_id": cid, "cls_name": name, "conf": float(score), "xyxy": mapped})
         records.append(DetectionRecord(cls_name=name, conf=float(score), xyxy=tuple(float(v) for v in mapped)))
 
-    mpp = float(meters_per_pixel) if meters_per_pixel and meters_per_pixel > 0 else None
+    mpp = float(meters_per_pixel) if meters_per_pixel and meters_per_pixel > 0 else _runtime.get("mpp_from_camera")
     report = assessor.assess(records, meters_per_pixel=mpp, image_wh=(w, h), update_elc=False)
 
     vis = draw_boxes(rgb, rows)
@@ -183,6 +204,7 @@ def run_infer(image, conf: float, iou: float, meters_per_pixel: float, imgsz: in
         viol_lines = "\n".join(
             f"- **{ev.kind}** 分数 {ev.score:.2f}：{ev.message}" for ev in report.violations
         )
+    cam_line = _runtime.get("camera_note") or ""
     md = (
         f"<div style='padding:12px;border-radius:8px;border:1px solid {color};'>"
         f"<p style='margin:0;color:{color};font-size:22px;font-weight:700;'>风险等级：{report.label_zh}</p>"
@@ -190,6 +212,7 @@ def run_infer(image, conf: float, iou: float, meters_per_pixel: float, imgsz: in
         f" ｜ 等级 {int(report.grade)} / 4"
         f" ｜ ELC 阈值 {[round(t, 3) for t in report.thresholds]}</p>"
         f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{_runtime['weights_note']}</p>"
+        f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{cam_line}</p>"
         f"</div>\n\n**违规项**\n\n{viol_lines}\n\n"
         f"**检测框数量：** {len(rows)}"
     )
@@ -207,7 +230,7 @@ def build_ui(imgsz: int):
         gr.Markdown(
             "## 电力安防视觉检测演示\n"
             "上传本地图片，运行轻量化 YOLOv5s（P2 小目标分支 + 注意力）并输出风险等级。\n"
-            "适合本机演示；无权重时为随机初始化，框结果仅用于打通流程。"
+            "适合本机演示；无权重时为随机初始化。真实数据集与相机标定请放在本地，仓库仅含代码与模板。"
         )
         with gr.Row():
             inp = gr.Image(type="filepath", label="上传图片", sources=["upload"])
@@ -241,6 +264,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--share", action="store_true")
+    p.add_argument(
+        "--camera-config",
+        type=str,
+        default=str(DEFAULT_LOCAL_CAMERA),
+        help="本地相机 YAML（默认 config/camera_sensor/camera.yaml；不存在则提示并跳过）",
+    )
+    p.add_argument(
+        "--working-distance-m",
+        type=float,
+        default=0.0,
+        help="目标大致深度（米），与真实内参一起估算米/像素；0 表示不估算",
+    )
     return p.parse_args()
 
 
@@ -248,7 +283,13 @@ def main() -> None:
     import gradio as gr
 
     args = parse_args()
-    init_runtime(weights=args.weights, attn=args.attn, device_name=args.device)
+    init_runtime(
+        weights=args.weights,
+        attn=args.attn,
+        device_name=args.device,
+        camera_config=args.camera_config,
+        working_distance_m=args.working_distance_m,
+    )
     demo = build_ui(args.imgsz)
     demo.launch(
         server_name=args.host,

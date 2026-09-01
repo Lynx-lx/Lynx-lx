@@ -1,11 +1,15 @@
 """数据集脚本共用工具：YOLO 目录约定、标签解析、万级遍历。
 
-默认布局（与电力安防检测一致）::
+公开仓库的 data/ 仅有空目录占位（.gitkeep），不含原始图片。
 
-    <root>/
-      images/   # jpg/png/...
-      labels/   # 同名 .txt，每行: class_id xc yc w h （归一化 0~1）
+本地预期布局::
 
+    data/
+      images/    # .jpg/.png/...  与 labels 按相对路径同名
+      labels/    # 每行: class_id xc yc w h （归一化 0~1，YOLO）
+      raw/ processed/ annotations/ samples/   # 可选
+
+也可把任意根目录传给 --root，只要其下有 images/ 与 labels/。
 不在本模块内写入或复制图像数据。
 """
 
@@ -109,7 +113,10 @@ def yolo_to_xyxy(xc: float, yc: float, w: float, h: float, width: int, height: i
 
 
 def resolve_dirs(root: Path, images: Path | None, labels: Path | None) -> tuple[Path, Path]:
-    """解析图像/标签目录：可显式传入，或使用 <root>/images 与 <root>/labels。"""
+    """解析图像/标签目录：可显式传入，或使用 <root>/images 与 <root>/labels。
+
+    公开仓库中这些目录通常只有 .gitkeep；本地放入真实图片后再跑脚本。
+    """
     images_dir = images if images is not None else root / "images"
     labels_dir = labels if labels is not None else root / "labels"
     return images_dir, labels_dir

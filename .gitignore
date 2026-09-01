@@ -115,16 +115,25 @@ models/checkpoints/*
 !models/pretrained/.gitkeep
 !models/checkpoints/.gitkeep
 
-# Datasets (keep empty dirs)
+# Datasets: keep directory placeholders only
 data/raw/*
 data/processed/*
 data/annotations/*
-data/images/
-data/labels/
+data/images/*
+data/labels/*
+data/samples/*
+!data/.gitkeep
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/annotations/.gitkeep
+!data/images/.gitkeep
+!data/labels/.gitkeep
 !data/samples/.gitkeep
+
+# Local real camera calibration (keep template + gitkeep)
+config/camera_sensor/*
+!config/camera_sensor/.gitkeep
+!config/camera_sensor/camera_template.yaml
 
 # Runtime outputs
 outputs/detections/*

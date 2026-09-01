@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from viscale.detection import POWER_SECURITY_CLASSES, build_yolov5s_lite
+from viscale.io.camera import load_camera_config
 
 
 def letterbox(image: np.ndarray, size: int = 640) -> tuple[np.ndarray, float, tuple[int, int]]:
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--out", type=str, default=str(ROOT / "outputs" / "detections" / "demo_yolov5s_lite.jpg"))
+    p.add_argument("--camera-config", type=str, default="", help="相机 YAML；默认查找 config/camera_sensor/camera.yaml")
     return p.parse_args()
 
 
@@ -95,6 +97,8 @@ def main() -> None:
         print("no weights given; using random init (boxes will be noisy)")
 
     print(f"attn={args.attn} params={model.parameter_count() / 1e6:.2f}M device={device}")
+    _cam, cam_msg = load_camera_config(args.camera_config or None)
+    print(cam_msg)
 
     if args.image:
         image = cv2.imread(args.image)

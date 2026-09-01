@@ -146,7 +146,10 @@ def main() -> None:
     args = parse_args()
     images_dir, labels_dir = resolve_dirs(args.root, args.images, args.labels)
     if not images_dir.is_dir():
-        raise SystemExit(f"图像目录不存在: {images_dir}")
+        raise SystemExit(
+            f"图像目录不存在: {images_dir}\n"
+            "公开仓库的 data/images 可能只有占位。请在本地放入图片后再运行。"
+        )
     names = load_class_names(args.names)
     summary = analyze(
         images_dir,
