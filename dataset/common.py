@@ -21,14 +21,10 @@ from pathlib import Path
 
 # 与 src/viscale/detection 中的类别顺序对齐（class_id 从 0 起）
 DEFAULT_CLASSES: tuple[str, ...] = (
-    "person",
-    "helmet",
     "insulator",
     "bird_nest",
-    "smoke",
-    "fire",
-    "vehicle",
     "foreign_object",
+    "damaged_insulator",
 )
 
 IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"})

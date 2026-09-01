@@ -27,7 +27,28 @@
 | 数据工程 | `dataset/`：标注越界/损坏图校验、train/val/test 划分、类别统计（万级流式） |
 | 演示 | `app.py`：Gradio 上传图片 → 画框 → 风险等级 |
 
-默认类别：`person, helmet, insulator, bird_nest, smoke, fire, vehicle, foreign_object`。仓库**不附带训练权重**；无 `.pt` 时随机初始化仅用于打通流程。
+默认检测类别 4 类：`insulator`, `bird_nest`, `foreign_object`, `damaged_insulator`。仓库**不附带训练权重**，也**没有电力标注训练集**，因此公开仓库无法提供能真实识别上述目标的业务权重。Web 加载顺序见下文。
+
+---
+
+## 项目效果展示
+
+`assets/demo/` 用于存放 **APP 界面截图**、**算法推理效果图**（检测框、风险等级等）。本仓库只保留该目录结构，**不附带真实截图二进制文件**；请在本地运行 `python app.py` 后自行截图，将 PNG 放到该目录并保持下列文件名，README 中的引用即可显示。
+
+<!-- 放入 ./assets/demo/app_ui.png 后，下方图片会在 GitHub 上显示 -->
+<p><b>Gradio 演示界面</b></p>
+<img src="./assets/demo/app_ui.png" width="600" alt="Gradio APP 界面截图（请自行放入 app_ui.png）">
+
+<!-- 放入 ./assets/demo/infer_result.png 后，下方图片会在 GitHub 上显示 -->
+<p><b>检测与风险评估效果</b></p>
+<img src="./assets/demo/infer_result.png" width="600" alt="算法推理效果图（请自行放入 infer_result.png）">
+
+建议文件名：
+
+| 文件 | 内容 |
+|------|------|
+| `./assets/demo/app_ui.png` | 本地演示页（上传区、阈值、风险等级） |
+| `./assets/demo/infer_result.png` | 带检测框的推理可视化 |
 
 ---
 
@@ -88,6 +109,83 @@ cp config/camera_sensor/camera_template.yaml config/camera_sensor/camera.yaml
 python app.py --camera-config config/camera_sensor/camera.yaml --working-distance-m 8
 ```
 
+### 权重文件说明
+
+**本仓库不包含任何 `.pt` 二进制。** 权重全部放在本地 `models/checkpoints/`，并由 `.gitignore` 忽略。详细约定见 [`models/checkpoints/README_WEIGHT.md`](models/checkpoints/README_WEIGHT.md)。
+
+| 本地文件 | 含义 |
+|----------|------|
+| `yolov5s_lite.pt` | 公开学术数据微调（CPLID+FOTL），由 `scripts/train_yolov5s_lite.py` 生成；**不提交 git** |
+| `yolov5s_lite_demo.pt` | 由 `scripts/pretrain_adapter.py` 生成：仅迁移公开 COCO 主干中形状匹配的参数，**检测头随机初始化** |
+| `yolov5s.pt` | 官方 YOLOv5s COCO 预训练，仅作适配器输入，需自行下载 |
+
+Web `app.py` 加载优先级：
+
+1. 存在 `yolov5s_lite.pt` → 按微调权重推理  
+2. 否则存在 `yolov5s_lite_demo.pt` → 加载并在**后端日志与页面**提示：不能真实识别电力目标  
+3. 两者都没有 → **演示模拟模式**（构造模拟框，不返回空列表，前端不出现本机绝对路径）
+
+---
+
+## COCO 主干适配脚本（`scripts/pretrain_adapter.py`）
+
+本仓库**不使用电力标注数据集训练**，因此无法得到能识别绝缘子、鸟巢、异物、绝缘子缺陷的业务权重。该脚本只保证**网络结构完整、推理链路可跑通**，供代码仓库展示。
+
+**【重要说明】** `yolov5s_lite_demo.pt` 仅仅网络结构完整；检测头随机初始化，未在电力标注数据集做微调，**不能真实识别鸟巢、绝缘子缺陷**；仅用于跑通整个推理链路，**不可以用于实际安防业务**。请勿将 demo 权重表述为「已训练好的电力检测模型」。
+
+本地生成（不把 pt 提交 git）：
+
+```bash
+# 自行下载官方 yolov5s.pt（COCO），放到 models/checkpoints/yolov5s.pt
+python scripts/pretrain_adapter.py
+# 产出：models/checkpoints/yolov5s_lite_demo.pt
+python app.py
+```
+
+适配逻辑摘要：构建 4 类 YOLOv5s‑P2+注意力网络 → 按 tensor 形状尽量拷贝 COCO 主干 → **不拷贝检测头** → 导出 demo 权重。官方 `yolov5s` 与本仓库模块命名不同，主干只能部分匹配，属预期行为。
+
+---
+
+## 公开数据微调（生成 `yolov5s_lite.pt`）
+
+需要**检测头经过标注训练**时，在本地用公开数据集微调（数据与权重均不入库）。
+
+| 公开集 | 用途 | 来源 |
+|--------|------|------|
+| CPLID | 正常绝缘子、绝缘子缺陷 | [InsulatorDataSet](https://github.com/InsulatorData/InsulatorDataSet) |
+| FOTL_Drone | 鸟巢、风筝/气球等异物 | [FOTL_Drone](https://github.com/Changping-Li/FOTL_Drone) |
+| YOLOv5s COCO | 主干初始化 | [ultralytics yolov5s.pt v7.0](https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt) |
+
+```bash
+python scripts/prepare_public_power_data.py
+python scripts/train_yolov5s_lite.py --epochs 40 --imgsz 416 --batch 4
+python app.py
+```
+
+类别映射：绝缘子→`insulator`，缺陷→`damaged_insulator`，nest→`bird_nest`，kite/balloon/monkey→`foreign_object`。fire/person 丢弃。
+
+公开集规模有限、部分缺陷为合成图，**不能宣传为电网投产模型**。
+
+---
+
+## 本地运行说明‑权重配置
+
+1. **仓库不含预训练权重。** 目录 `models/checkpoints/` 与 `*.pt` / `*.pth` 已写入 `.gitignore`。
+2. **两个业务/demo 权重都没有：** 进入**演示模拟模式**。按图片宽高构造 2～4 个四类模拟框，并走置信度过滤与 NMS。提示为「【演示模拟模式】…」，不含本机绝对路径。
+3. **仅有 `yolov5s_lite_demo.pt`：** 走模型前向，但检测头未微调，框可能为空或无意义；页面会写明无电力识别能力。
+4. **有 `yolov5s_lite.pt`：** 走公开数据微调后的检测（见上文训练脚本）。现场效果仍取决于数据覆盖。
+5. **测试图与输出：** 本地测试图建议放在 `data/`（如 `data/images/`）；推理可视化写入 `output/`（不入库）。可挑选样例复制到 `assets/demo/` 供 README 展示。
+6. **启动步骤：**
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
+```
+
+浏览器打开 `http://127.0.0.1:7860`，上传 `data/` 中的图片，点击「检测并评估风险」。
+
 ---
 
 ## 环境与运行
@@ -107,7 +205,7 @@ GPU 可选：先按 [PyTorch](https://pytorch.org/get-started/locally/) 安装 C
 python app.py
 ```
 
-浏览器打开 `http://127.0.0.1:7860`。可选：`--weights models/checkpoints/yolov5s_lite.pt`、`--device cpu`、`--attn eca`。
+浏览器打开 `http://127.0.0.1:7860`。可选：`--weights models/checkpoints/yolov5s_lite.pt`（或 demo 权重）、`--device cpu`、`--attn eca`。
 
 ```bash
 python scripts/demo_yolov5s_lite.py --image path/to/local.jpg
@@ -121,17 +219,19 @@ python scripts/demo_yolov5s_lite.py --image path/to/local.jpg
 .
 ├── app.py
 ├── requirements.txt
+├── assets/demo/             # 演示截图占位（PNG 需自行放入）
 ├── config/camera_sensor/    # 传感器：仅模板 + gitkeep
 ├── configs/                 # 其它配置占位
 ├── data/                    # 仅 gitkeep；本地放图与标签
 ├── dataset/                 # 校验 / 划分 / 统计脚本
 ├── models/                  # 权重目录（*.pt 不入库）
+├── output/                  # 推理可视化（不入库）
 ├── src/viscale/
 │   ├── detection/
 │   ├── io/                  # 相机 YAML、数据目录约定
 │   ├── measurement/
 │   └── risk/
-├── scripts/
+├── scripts/                 # 含 pretrain_adapter.py（不生成仓库内 pt）
 └── tests/
 ```
 

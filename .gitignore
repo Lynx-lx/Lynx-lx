@@ -98,9 +98,12 @@ temp/
 *_tmp*
 tempCodeRunnerFile.py
 
-# Weights & exported models
+# Weights: never commit checkpoints (keep README + gitkeep)
 *.pt
 *.pth
+models/checkpoints/*
+!models/checkpoints/.gitkeep
+!models/checkpoints/README_WEIGHT.md
 *.onnx
 *.engine
 *.tflite
@@ -111,9 +114,7 @@ tempCodeRunnerFile.py
 *.pkl
 *.h5
 models/pretrained/*
-models/checkpoints/*
 !models/pretrained/.gitkeep
-!models/checkpoints/.gitkeep
 
 # Datasets: keep directory placeholders only
 data/raw/*
@@ -122,6 +123,7 @@ data/annotations/*
 data/images/*
 data/labels/*
 data/samples/*
+data/public_yolo/*
 !data/.gitkeep
 !data/raw/.gitkeep
 !data/processed/.gitkeep
@@ -136,6 +138,9 @@ config/camera_sensor/*
 !config/camera_sensor/camera_template.yaml
 
 # Runtime outputs
+output/
+output/*
+!output/.gitkeep
 outputs/detections/*
 outputs/measurements/*
 !outputs/detections/.gitkeep

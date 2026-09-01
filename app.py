@@ -5,13 +5,15 @@
     pip install -r requirements.txt
     python app.py
 
-权重路径通过 --weights 或环境变量 VISCALE_WEIGHTS 预留；文件不存在则随机初始化。
+加载优先级：yolov5s_lite.pt（业务微调）→ yolov5s_lite_demo.pt（COCO 主干、头随机）→ 模拟框。
+不把本机绝对路径返回给前端。
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -24,15 +26,33 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from viscale.detection import POWER_SECURITY_CLASSES, build_yolov5s_lite
-from viscale.io.camera import DEFAULT_LOCAL_CAMERA, load_camera_config
+from viscale.detection.decode import nms as boxes_nms
+from viscale.io.camera import load_camera_config
 from viscale.measurement.scale import meters_per_pixel_at_depth
 from viscale.risk import DetectionRecord, RiskAssessor
 
-# ---------- 预留配置（可被 CLI / 环境变量覆盖）----------
-DEFAULT_WEIGHTS = os.environ.get("VISCALE_WEIGHTS", str(ROOT / "models" / "checkpoints" / "yolov5s_lite.pt"))
+# 权重只放在仓库相对路径下；默认文件名，不把 .pt 打进代码仓库
+CHECKPOINTS_REL = "models/checkpoints"
+REAL_WEIGHTS_REL = f"{CHECKPOINTS_REL}/yolov5s_lite.pt"
+DEMO_WEIGHTS_REL = f"{CHECKPOINTS_REL}/yolov5s_lite_demo.pt"
+DEFAULT_WEIGHTS_REL = REAL_WEIGHTS_REL
+DEFAULT_WEIGHTS = os.environ.get("VISCALE_WEIGHTS", "")
 DEFAULT_ATTN = os.environ.get("VISCALE_ATTN", "eca")
 DEFAULT_DEVICE = os.environ.get("VISCALE_DEVICE", "cpu")
 DEFAULT_IMGSZ = int(os.environ.get("VISCALE_IMGSZ", "640"))
+
+DEMO_MODE_HINT = (
+    "⚠️【演示模拟模式】未找到预训练权重，展示模拟检测框，放置权重文件可获得真实检测效果"
+)
+WEIGHTS_LOAD_FAIL_HINT = (
+    "⚠️【演示模拟模式】预训练权重读取失败，展示模拟检测框，放置权重文件可获得真实检测效果"
+)
+WEIGHTS_OK_HINT = "已加载微调权重 yolov5s_lite.pt（models/checkpoints/）。"
+WEIGHTS_ADAPTER_HINT = (
+    "⚠️已加载 yolov5s_lite_demo.pt：仅 COCO 主干部分迁移、检测头随机初始化，"
+    "未做电力数据微调，不具备真实电力目标识别能力。"
+)
+OUTPUT_REL = "output"
 
 BOX_COLORS = [
     (46, 204, 113),
@@ -54,6 +74,10 @@ _runtime: dict = {
     "weights_note": "",
     "camera_note": "",
     "mpp_from_camera": None,
+    "demo_mode": True,
+    "weights_loaded": False,
+    "weights_arg": REAL_WEIGHTS_REL,
+    "infer_kind": "mock",
 }
 
 
@@ -63,20 +87,94 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def _load_weights(model: torch.nn.Module, path: str, device: torch.device) -> str:
-    if not path:
-        return "未配置权重，当前为随机初始化（演示框可能无意义）"
-    p = Path(path)
-    if not p.is_file():
-        return f"权重文件不存在，已跳过加载: {p}（随机初始化）"
-    ckpt = torch.load(str(p), map_location=device)
+def _redact_abs_paths(text: str) -> str:
+    """前端展示用：去掉 Windows/Unix 绝对路径，避免 C:/Users/... 出现在页面上。"""
+    if not text:
+        return ""
+    text = re.sub(r"[A-Za-z]:[\\/][^\s<>\"']+", "[local]", text)
+    text = re.sub(r"(?<![A-Za-z:])/(?:Users|home|mnt)/[^\s<>\"']+", "[local]", text)
+    return text
+
+
+def _weights_path(path: str) -> Path:
+    p = Path(path) if path else Path(DEFAULT_WEIGHTS_REL)
+    if not p.is_absolute():
+        p = ROOT / p
+    return p
+
+
+def _checkpoint_exists(path: str | None = None) -> bool:
+    p = _weights_path(path or DEFAULT_WEIGHTS_REL)
+    try:
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _select_weight_file(preferred: str | None) -> tuple[str | None, str]:
+    """优先真实微调权重，其次 adapter demo 权重，否则无文件。kind: real|coco_demo|mock"""
+    cand: list[tuple[str, str]] = []
+    if preferred and str(preferred).strip():
+        cand.append((preferred.strip(), "custom"))
+    cand.append((REAL_WEIGHTS_REL, "real"))
+    cand.append((DEMO_WEIGHTS_REL, "coco_demo"))
+    seen: set[str] = set()
+    for rel, kind in cand:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not _checkpoint_exists(rel):
+            continue
+        if kind == "custom":
+            kind = "coco_demo" if "demo" in Path(rel).name.lower() else "real"
+        return rel, kind
+    return None, "mock"
+
+
+def _torch_load(path: Path, device: torch.device):
+    try:
+        return torch.load(str(path), map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location=device)
+
+
+def _unwrap_ckpt_state(ckpt):
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     if hasattr(state, "state_dict"):
         state = state.state_dict()
-    model.load_state_dict(state, strict=False)
-    return f"已加载权重: {p}"
+    return state
+
+
+def _try_load_weights(
+    model: torch.nn.Module,
+    path: str | None,
+    device: torch.device,
+) -> tuple[bool, str, str]:
+    """返回 (是否加载了可前向的权重, 前端提示, infer_kind)。"""
+    rel, kind = _select_weight_file(path)
+    if rel is None or kind == "mock":
+        print("[info] no yolov5s_lite.pt or yolov5s_lite_demo.pt; mock boxes")
+        return False, DEMO_MODE_HINT, "mock"
+    try:
+        ckpt = _torch_load(_weights_path(rel), device)
+        state = _unwrap_ckpt_state(ckpt)
+        if not isinstance(state, dict):
+            print("[warn] checkpoint format unsupported; mock boxes")
+            return False, WEIGHTS_LOAD_FAIL_HINT, "mock"
+        model.load_state_dict(state, strict=False)
+        if kind == "coco_demo":
+            print("[warn] loaded yolov5s_lite_demo.pt: COCO backbone only, random detect head, NOT power-trained")
+            return True, WEIGHTS_ADAPTER_HINT, "coco_demo"
+        print("[info] loaded yolov5s_lite.pt from models/checkpoints/")
+        return True, WEIGHTS_OK_HINT, "real"
+    except (OSError, FileNotFoundError, KeyError, RuntimeError, ValueError, TypeError):
+        print("[warn] checkpoint load failed; mock boxes")
+        return False, WEIGHTS_LOAD_FAIL_HINT, "mock"
+    except Exception:
+        print("[warn] checkpoint load failed; mock boxes")
+        return False, WEIGHTS_LOAD_FAIL_HINT, "mock"
 
 
 def init_runtime(
@@ -90,19 +188,28 @@ def init_runtime(
         device = _resolve_device(device_name)
         model = build_yolov5s_lite(num_classes=len(POWER_SECURITY_CLASSES), attn=attn).to(device)
         model.eval()
-        note = _load_weights(model, weights, device)
-        cam_path = camera_config or str(DEFAULT_LOCAL_CAMERA)
-        cam, cam_msg = load_camera_config(cam_path)
-        print(cam_msg)
+        loaded, note, kind = _try_load_weights(model, weights, device)
+        cam_path = camera_config or "config/camera_sensor/camera.yaml"
+        cam, _cam_msg = load_camera_config(cam_path)
         mpp = meters_per_pixel_at_depth(cam, working_distance_m) if working_distance_m > 0 else None
+        if cam is None:
+            cam_ui = "未找到本地相机标定（config/camera_sensor/camera.yaml），已跳过内参尺度。"
+        else:
+            cam_ui = "已读取相机配置（config/camera_sensor/）。"
+            if cam.is_template:
+                cam_ui += " 当前为模板占位，不可当作现场标定。"
         _runtime["model"] = model
         _runtime["device"] = device
         _runtime["assessor"] = RiskAssessor()
-        _runtime["weights_note"] = note
-        _runtime["camera_note"] = cam_msg.split("\n")[0]
+        _runtime["weights_note"] = _redact_abs_paths(note)
+        _runtime["camera_note"] = _redact_abs_paths(cam_ui)
         _runtime["mpp_from_camera"] = mpp
-        print(note)
-        print(f"device={device} params={model.parameter_count() / 1e6:.2f}M attn={attn}")
+        selected, _ = _select_weight_file(weights)
+        _runtime["demo_mode"] = kind == "mock"
+        _runtime["weights_loaded"] = loaded
+        _runtime["weights_arg"] = selected or ""
+        _runtime["infer_kind"] = kind
+        print("[info] infer_kind=%s demo_mode=%s device=%s attn=%s" % (kind, _runtime["demo_mode"], device, attn))
 
 
 def letterbox(image_bgr: np.ndarray, size: int) -> tuple[np.ndarray, float, tuple[int, int]]:
@@ -146,19 +253,85 @@ def draw_boxes(image_rgb: np.ndarray, rows: list[dict]) -> np.ndarray:
     return bgr[:, :, ::-1]
 
 
+def _mock_detections(height: int, width: int) -> list[dict]:
+    """演示模拟模式：按图像宽高构造 2～4 个假框（非真实检测）。禁止返回空列表。"""
+    h = max(int(height), 32)
+    w = max(int(width), 32)
+    names = list(POWER_SECURITY_CLASSES)
+    name_to_id = {n: i for i, n in enumerate(names)}
+    presets = (
+        (0.08, 0.18, 0.36, 0.62, "insulator", 0.72),
+        (0.42, 0.12, 0.68, 0.40, "bird_nest", 0.61),
+        (0.58, 0.48, 0.88, 0.82, "foreign_object", 0.55),
+        (0.18, 0.58, 0.40, 0.86, "damaged_insulator", 0.48),
+    )
+    rows: list[dict] = []
+    for x1r, y1r, x2r, y2r, name, score in presets:
+        x1 = int(np.clip(round(x1r * w), 0, w - 2))
+        y1 = int(np.clip(round(y1r * h), 0, h - 2))
+        x2 = int(np.clip(round(x2r * w), x1 + 8, w - 1))
+        y2 = int(np.clip(round(y2r * h), y1 + 8, h - 1))
+        cid = int(name_to_id.get(name, 0))
+        rows.append(
+            {
+                "cls_id": cid,
+                "cls_name": name,
+                "conf": float(score),
+                "xyxy": [int(x1), int(y1), int(x2), int(y2)],
+            }
+        )
+    return rows[:4]
+
+
+def _filter_demo_boxes(rows: list[dict], conf_thres: float, iou_thres: float) -> list[dict]:
+    """对模拟框走与真实推理相同的置信度过滤 + NMS；过滤后若为空则回退至少 2 框。"""
+    kept = [r for r in rows if float(r["conf"]) >= float(conf_thres)]
+    if len(kept) >= 2:
+        boxes = torch.tensor([r["xyxy"] for r in kept], dtype=torch.float32)
+        scores = torch.tensor([r["conf"] for r in kept], dtype=torch.float32)
+        order = boxes_nms(boxes, scores, float(iou_thres))
+        kept = [kept[int(i)] for i in order.tolist()]
+    if len(kept) < 2:
+        # 演示模式禁止空列表：保留置信度最高的 2 个原始模拟框
+        kept = sorted(rows, key=lambda r: r["conf"], reverse=True)[:2]
+    return kept
+
+
+def _save_vis_relative(vis_rgb: np.ndarray) -> None:
+    """可视化写入仓库相对目录 output/，路径不返回前端。"""
+    try:
+        out_dir = ROOT / OUTPUT_REL
+        out_dir.mkdir(parents=True, exist_ok=True)
+        bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(out_dir / "last_infer.jpg"), bgr)
+    except OSError:
+        print("[warn] could not write visualization under output/")
+
+
 def as_rgb(image) -> np.ndarray | None:
-    """接受 Gradio numpy / 路径 / PIL。返回 RGB uint8。"""
+    """接受 Gradio numpy / filepath / ImageData / PIL。返回 RGB uint8。"""
     if image is None:
         return None
+    if isinstance(image, dict):
+        image = image.get("path") or image.get("orig_path") or image.get("url")
+    if hasattr(image, "path") and not isinstance(image, (str, Path, np.ndarray)):
+        image = getattr(image, "path", None)
     if isinstance(image, (str, Path)):
-        data = np.fromfile(str(image), dtype=np.uint8)
+        try:
+            data = np.fromfile(str(image), dtype=np.uint8)
+        except OSError:
+            return None
         bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if bgr is None:
             return None
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if hasattr(image, "convert"):
+        image = np.asarray(image.convert("RGB"))
     arr = np.asarray(image)
     if arr.ndim == 2:
         return cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    if arr.ndim != 3:
+        return None
     if arr.shape[2] == 4:
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
     return arr
@@ -169,58 +342,100 @@ def as_bgr(image_rgb: np.ndarray) -> np.ndarray:
 
 
 def run_infer(image, conf: float, iou: float, meters_per_pixel: float, imgsz: int):
-    rgb = as_rgb(image)
-    if rgb is None:
-        return None, "请先上传本地图片。", []
+    try:
+        if _runtime.get("assessor") is None:
+            init_runtime(DEFAULT_WEIGHTS, DEFAULT_ATTN, DEFAULT_DEVICE)
 
-    model = _runtime["model"]
-    device = _runtime["device"]
-    assessor: RiskAssessor = _runtime["assessor"]
-    names = list(model.class_names)
-    image_bgr = as_bgr(rgb)
-    h, w = image_bgr.shape[:2]
-    canvas, scale, pad = letterbox(image_bgr, int(imgsz))
-    tensor = to_tensor(canvas, device)
+        rgb = as_rgb(image)
+        if rgb is None:
+            return None, "请先上传本地图片（可从 data/ 选择测试图）。", {"headers": ["类别", "置信度", "x1", "y1", "x2", "y2"], "data": []}
 
-    with torch.inference_mode():
-        dets = model.predict(tensor, conf_thres=float(conf), iou_thres=float(iou))[0]
+        assessor: RiskAssessor = _runtime["assessor"]
+        names = list(POWER_SECURITY_CLASSES)
+        model = _runtime.get("model")
+        if model is not None and getattr(model, "class_names", None):
+            names = list(model.class_names)
+        h, w = int(rgb.shape[0]), int(rgb.shape[1])
 
-    rows: list[dict] = []
-    records: list[DetectionRecord] = []
-    for *xyxy, score, cls_id in dets.cpu().tolist():
-        mapped = map_xyxy(xyxy, pad, scale, (w, h))
-        cid = int(cls_id)
-        name = names[cid] if 0 <= cid < len(names) else str(cid)
-        rows.append({"cls_id": cid, "cls_name": name, "conf": float(score), "xyxy": mapped})
-        records.append(DetectionRecord(cls_name=name, conf=float(score), xyxy=tuple(float(v) for v in mapped)))
-
-    mpp = float(meters_per_pixel) if meters_per_pixel and meters_per_pixel > 0 else _runtime.get("mpp_from_camera")
-    report = assessor.assess(records, meters_per_pixel=mpp, image_wh=(w, h), update_elc=False)
-
-    vis = draw_boxes(rgb, rows)
-    color = GRADE_COLOR.get(int(report.grade), "#333")
-    viol_lines = "无"
-    if report.violations:
-        viol_lines = "\n".join(
-            f"- **{ev.kind}** 分数 {ev.score:.2f}：{ev.message}" for ev in report.violations
+        kind = _runtime.get("infer_kind") or "mock"
+        weight_rel = _runtime.get("weights_arg") or ""
+        use_weights = (
+            bool(_runtime.get("weights_loaded"))
+            and kind in ("real", "coco_demo")
+            and bool(weight_rel)
+            and _checkpoint_exists(weight_rel)
         )
-    cam_line = _runtime.get("camera_note") or ""
-    md = (
-        f"<div style='padding:12px;border-radius:8px;border:1px solid {color};'>"
-        f"<p style='margin:0;color:{color};font-size:22px;font-weight:700;'>风险等级：{report.label_zh}</p>"
-        f"<p style='margin:8px 0 0;'>综合分数 <b>{report.score:.3f}</b>"
-        f" ｜ 等级 {int(report.grade)} / 4"
-        f" ｜ ELC 阈值 {[round(t, 3) for t in report.thresholds]}</p>"
-        f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{_runtime['weights_note']}</p>"
-        f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{cam_line}</p>"
-        f"</div>\n\n**违规项**\n\n{viol_lines}\n\n"
-        f"**检测框数量：** {len(rows)}"
-    )
-    table = [
-        [r["cls_name"], f"{r['conf']:.3f}", r["xyxy"][0], r["xyxy"][1], r["xyxy"][2], r["xyxy"][3]]
-        for r in rows
-    ]
-    return vis, md, table
+
+        if use_weights and model is not None:
+            image_bgr = as_bgr(rgb)
+            canvas, scale, pad = letterbox(image_bgr, int(imgsz))
+            tensor = to_tensor(canvas, _runtime["device"])
+            with torch.inference_mode():
+                dets = model.predict(tensor, conf_thres=float(conf), iou_thres=float(iou))[0]
+            rows = []
+            for *xyxy, score, cls_id in dets.cpu().tolist():
+                mapped = map_xyxy(xyxy, pad, scale, (w, h))
+                cid = int(cls_id)
+                name = names[cid] if 0 <= cid < len(names) else str(cid)
+                rows.append(
+                    {
+                        "cls_id": cid,
+                        "cls_name": name,
+                        "conf": float(score),
+                        "xyxy": [int(mapped[0]), int(mapped[1]), int(mapped[2]), int(mapped[3])],
+                    }
+                )
+        else:
+            print("[info] demo simulation: building mock boxes (no checkpoint)")
+            _runtime["demo_mode"] = True
+            _runtime["weights_note"] = DEMO_MODE_HINT
+            rows = _filter_demo_boxes(_mock_detections(h, w), float(conf), float(iou))
+            if len(rows) < 2:
+                rows = _mock_detections(h, w)[:3]
+
+        records = [
+            DetectionRecord(
+                cls_name=r["cls_name"],
+                conf=float(r["conf"]),
+                xyxy=tuple(float(v) for v in r["xyxy"]),
+            )
+            for r in rows
+        ]
+        mpp = float(meters_per_pixel) if meters_per_pixel and meters_per_pixel > 0 else _runtime.get("mpp_from_camera")
+        report = assessor.assess(records, meters_per_pixel=mpp, image_wh=(w, h), update_elc=False)
+
+        vis = draw_boxes(rgb, rows)
+        _save_vis_relative(vis)
+        color = GRADE_COLOR.get(int(report.grade), "#333")
+        viol_lines = "无"
+        if report.violations:
+            viol_lines = "\n".join(
+                f"- **{ev.kind}** 分数 {ev.score:.2f}：{ev.message}" for ev in report.violations
+            )
+        cam_line = _redact_abs_paths(_runtime.get("camera_note") or "")
+        weights_line = _redact_abs_paths(_runtime.get("weights_note") or "")
+        md = (
+            f"<div style='padding:12px;border-radius:8px;border:1px solid {color};'>"
+            f"<p style='margin:0;color:{color};font-size:22px;font-weight:700;'>风险等级：{report.label_zh}</p>"
+            f"<p style='margin:8px 0 0;'>综合分数 <b>{report.score:.3f}</b>"
+            f" ｜ 等级 {int(report.grade)} / 4"
+            f" ｜ ELC 阈值 {[round(t, 3) for t in report.thresholds]}</p>"
+            f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{weights_line}</p>"
+            f"<p style='margin:8px 0 0;color:#666;font-size:13px;'>{cam_line}</p>"
+            f"</div>\n\n**违规项**\n\n{viol_lines}\n\n"
+            f"**检测框数量：** {len(rows)}"
+        )
+        table = {
+            "headers": ["类别", "置信度", "x1", "y1", "x2", "y2"],
+            "data": [
+                [r["cls_name"], f"{r['conf']:.3f}", r["xyxy"][0], r["xyxy"][1], r["xyxy"][2], r["xyxy"][3]]
+                for r in rows
+            ],
+        }
+        return vis, md, table
+    except Exception as exc:
+        print("[warn] infer pipeline failed:", type(exc).__name__)
+        return None, "推理失败，请检查上传图片后重试。", {"headers": ["类别", "置信度", "x1", "y1", "x2", "y2"], "data": []}
 
 
 def build_ui(imgsz: int):
@@ -229,8 +444,8 @@ def build_ui(imgsz: int):
     with gr.Blocks(title="电力安防 · 检测与风险评估") as demo:
         gr.Markdown(
             "## 电力安防视觉检测演示\n"
-            "上传本地图片，运行轻量化 YOLOv5s（P2 小目标分支 + 注意力）并输出风险等级。\n"
-            "适合本机演示；无权重时为随机初始化。真实数据集与相机标定请放在本地，仓库仅含代码与模板。"
+            "上传本地图片，运行轻量化 YOLOv5s（P2 小目标分支 + 注意力，4 类）并输出风险等级。\n"
+            "加载顺序：微调权重 yolov5s_lite.pt → adapter 的 yolov5s_lite_demo.pt（头随机，无电力识别能力）→ 无权重则模拟框。"
         )
         with gr.Row():
             inp = gr.Image(type="filepath", label="上传图片", sources=["upload"])
@@ -257,7 +472,12 @@ def build_ui(imgsz: int):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Gradio 本地检测 + 风险评估演示")
-    p.add_argument("--weights", type=str, default=DEFAULT_WEIGHTS, help="预留权重路径 .pt")
+    p.add_argument(
+        "--weights",
+        type=str,
+        default=DEFAULT_WEIGHTS,
+        help="可选指定权重；默认自动：yolov5s_lite.pt → yolov5s_lite_demo.pt → 模拟框",
+    )
     p.add_argument("--attn", type=str, default=DEFAULT_ATTN, choices=("eca", "se", "cbam", "none"))
     p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
@@ -267,7 +487,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--camera-config",
         type=str,
-        default=str(DEFAULT_LOCAL_CAMERA),
+        default="config/camera_sensor/camera.yaml",
         help="本地相机 YAML（默认 config/camera_sensor/camera.yaml；不存在则提示并跳过）",
     )
     p.add_argument(

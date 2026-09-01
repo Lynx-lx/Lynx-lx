@@ -13,14 +13,10 @@ from viscale.detection.blocks import C3, SPPF, Conv
 from viscale.detection.decode import non_max_suppression
 
 POWER_SECURITY_CLASSES = (
-    "person",
-    "helmet",
     "insulator",
     "bird_nest",
-    "smoke",
-    "fire",
-    "vehicle",
     "foreign_object",
+    "damaged_insulator",
 )
 
 # P2/4 extra-small, P3/8 small, P4/16 medium, P5/32 large
