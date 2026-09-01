@@ -1,0 +1,9 @@
+# Python 3.10+
+# 安装: pip install -r requirements.txt
+# GPU 版 torch 请按 https://pytorch.org/get-started/locally/ 单独安装后，再装其余包。
+
+numpy>=1.26.0
+opencv-python>=4.8.0
+pillow>=10.0.0
+torch>=2.1.0
+gradio>=4.44.0
