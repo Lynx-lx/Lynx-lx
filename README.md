@@ -8,7 +8,7 @@
 
 **大模型 / Agent**：ReAct、Function-Calling、上下文工程；LangGraph；金标数据构建、LLM-as-Judge、消融与 bad-case 迭代；了解 SFT / DPO 基础。
 
-**计算机视觉**：YOLO 系列、OpenCV 预处理、mAP 评估、难例挖掘、仿真图像生成。
+**计算机视觉**：YOLO 系列、OpenCV 预处理、mAP 评估、难例挖掘、CARLA仿真图像生成。
 
 **数据**：Hive SQL、MySQL、S3；数据清洗、特征提取、标注与样本筛选。
 
